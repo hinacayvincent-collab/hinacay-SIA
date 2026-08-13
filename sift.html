@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>sift</title>
+<style>
+  :root { --hue: 38; }
+  html, body {
+    margin: 0;
+    height: 100%;
+    background: hsl(38, 26%, 6%);
+    overflow: hidden;
+    cursor: none;
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  }
+  canvas#main { display: block; width: 100vw; height: 100vh; image-rendering: pixelated; }
+  #hint {
+    position: fixed;
+    left: 50%; top: 46%;
+    transform: translate(-50%, -50%);
+    font-size: 12px;
+    letter-spacing: 0.35em;
+    text-transform: uppercase;
+    color: hsla(38, 55%, 85%, 0.32);
+    pointer-events: none;
+    transition: opacity 2s ease;
+    text-align: center;
+    line-height: 2;
+    white-space: nowrap;
+  }
+  #caret {
+    position: fixed;
+    top: 0;
+    width: 2px;
+    background: hsla(38, 70%, 88%, 0.55);
+    pointer-events: none;
+    animation: blink 1.1s steps(1) infinite;
+    z-index: 5;
+  }
+  @keyframes blink { 50% { opacity: 0.05; } }
+</style>
+</head>
+<body>
+<canvas id="main"></canvas>
+<div id="hint">type &nbsp;·&nbsp; move &nbsp;·&nbsp; it fills, then it clears itself</div>
+<div id="caret"></div>
+<script>
+const HUE = 38; // the only hue in the whole piece
+const CELL = 4;
+
+const main = document.getElementById('main');
+const mctx = main.getContext('2d');
+const hint = document.getElementById('hint');
+const caret = document.getElementById('caret');
+
+let W, H, DPR, cols, rows;
+let occ, shadeArr;
+let sandCanvas, sctx, sandImg;
+
+function build() {
+  DPR = Math.min(window.devicePixelRatio || 1, 2);
+  W = window.innerWidth;
+  H = window.innerHeight;
+  main.width = W * DPR;
+  main.height = H * DPR;
+  mctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  mctx.imageSmoothingEnabled = false;
+
+  cols = Math.floor(W / CELL);
+  rows = Math.floor(H / CELL);
+  occ = new Uint8Array(cols * rows);
+  shadeArr = new Uint8Array(cols * rows);
+
+  sandCanvas = document.createElement('canvas');
+  sandCanvas.width = cols;
+  sandCanvas.height = rows;
+  sctx = sandCanvas.getContext('2d');
+  sandImg = sctx.createImageData(cols, rows);
+}
+build();
+window.addEventListener('resize', () => { build(); });
+
+// ---- glyph sampling ----
+const glyphCanvas = document.createElement('canvas');
+glyphCanvas.width = 300; glyphCanvas.height = 300;
+const gctx = glyphCanvas.getContext('2d');
+gctx.font = '900 220px ui-monospace, monospace';
+gctx.textAlign = 'center';
+gctx.textBaseline = 'middle';
+gctx.fillStyle = '#fff';
+
+const STRIDE = 7;
+function sampleGlyph(ch) {
+  gctx.clearRect(0, 0, 300, 300);
+  gctx.fillText(ch, 150, 158);
+  const data = gctx.getImageData(0, 0, 300, 300).data;
+  const pts = [];
+  for (let gy = 0; gy < 300; gy += STRIDE) {
+    for (let gx = 0; gx < 300; gx += STRIDE) {
+      const a = data[(gy * 300 + gx) * 4 + 3];
+      if (a > 120) {
+        pts.push([Math.round((gx - 150) / STRIDE), Math.round((gy - 150) / STRIDE)]);
+      }
+    }
+  }
+  return pts;
+}
+
+// ---- sand grains ----
+const active = [];
+const MAX_ACTIVE = 3600;
+let everTyped = false;
+
+function idx(c, r) { return r * cols + c; }
+
+function spawnChar(ch, atCol) {
+  const pts = sampleGlyph(ch);
+  if (active.length > MAX_ACTIVE) return;
+  const startRow = -34;
+  for (const [dx, dy] of pts) {
+    if (active.length > MAX_ACTIVE) break;
+    const c = atCol + dx;
+    if (c < 0 || c >= cols) continue;
+    active.push({
+      col: c,
+      row: startRow + dy,
+      shade: 48 + Math.floor(Math.random() * 34),
+      settled: false
+    });
+  }
+}
+
+function settleGrain(g) {
+  const i = idx(g.col, g.row);
+  occ[i] = 1;
+  shadeArr[i] = g.shade;
+}
+function clearCell(c, r) {
+  if (r < 0 || r >= rows) return;
+  occ[idx(c, r)] = 0;
+}
+function isEmpty(c, r) {
+  if (c < 0 || c >= cols || r < 0 || r >= rows) return false;
+  return occ[idx(c, r)] === 0;
+}
+
+function stepGrain(g) {
+  if (g.row < 0) { g.row += 2; return; }
+  if (!occ[idx(g.col, g.row)]) settleGrain(g); // enter grid
+
+  const below = g.row + 1;
+  if (below >= rows) { g.settled = true; return; }
+
+  if (isEmpty(g.col, below)) {
+    clearCell(g.col, g.row);
+    g.row = below;
+    settleGrain(g);
+    return;
+  }
+  const dir = Math.random() < 0.5 ? -1 : 1;
+  if (isEmpty(g.col + dir, below)) {
+    clearCell(g.col, g.row);
+    g.col += dir; g.row = below;
+    settleGrain(g);
+    return;
+  }
+  if (isEmpty(g.col - dir, below)) {
+    clearCell(g.col, g.row);
+    g.col -= dir; g.row = below;
+    settleGrain(g);
+    return;
+  }
+  g.settled = true;
+}
+
+// ---- input ----
+let pointerCol = Math.floor(cols / 2);
+let pointerX = W / 2, pointerY = H / 2;
+let lastPX = pointerX, lastPY = pointerY;
+
+window.addEventListener('pointermove', (e) => {
+  lastPX = pointerX; lastPY = pointerY;
+  pointerX = e.clientX; pointerY = e.clientY;
+  pointerCol = Math.floor(pointerX / CELL);
+  caret.style.left = pointerX + 'px';
+  const vx = pointerX - lastPX, vy = pointerY - lastPY;
+  const speed = Math.hypot(vx, vy);
+  if (speed > 14) blow(pointerCol, Math.floor(pointerY / CELL), vx);
+});
+
+function blow(col, row, vx) {
+  const dir = vx > 0 ? 1 : -1;
+  const R = 6;
+  let touched = 0;
+  for (let dr = -R; dr <= R && touched < 24; dr++) {
+    for (let dc = -R; dc <= R && touched < 24; dc++) {
+      if (dc * dc + dr * dr > R * R) continue;
+      const c = col + dc, r = row + dr;
+      if (r < 0 || r >= rows || c < 0 || c >= cols) continue;
+      if (occ[idx(c, r)] && Math.random() < 0.35) {
+        clearCell(c, r);
+        active.push({ col: c + dir, row: r, shade: shadeArr[idx(c, r)] || 60, settled: false });
+        touched++;
+      }
+    }
+  }
+}
+
+window.addEventListener('keydown', (e) => {
+  if (e.key.length === 1 && !e.metaKey && !e.ctrlKey && !e.altKey) {
+    if (!everTyped) { everTyped = true; hint.style.opacity = '0'; }
+    spawnChar(e.key === ' ' ? '·' : e.key, pointerCol);
+  }
+});
+window.addEventListener('touchmove', (e) => {
+  e.preventDefault();
+  const t = e.touches[0];
+  lastPX = pointerX; lastPY = pointerY;
+  pointerX = t.clientX; pointerY = t.clientY;
+  pointerCol = Math.floor(pointerX / CELL);
+  caret.style.left = pointerX + 'px';
+  blow(pointerCol, Math.floor(pointerY / CELL), pointerX - lastPX);
+}, { passive: false });
+
+// ---- self-clearing wave when it gets too full ----
+let clearing = false;
+let clearFront = 0;
+let occupiedCount = 0;
+
+function recount() {
+  let n = 0;
+  for (let i = 0; i < occ.length; i++) n += occ[i];
+  occupiedCount = n;
+}
+let frame = 0;
+
+function tick() {
+  frame++;
+  for (let i = active.length - 1; i >= 0; i--) {
+    const g = active[i];
+    stepGrain(g);
+    if (g.settled) active.splice(i, 1);
+  }
+
+  if (frame % 20 === 0) recount();
+  const fill = occupiedCount / (cols * rows);
+  if (!clearing && fill > 0.5) { clearing = true; clearFront = 0; }
+  if (clearing) {
+    const sweep = Math.max(2, Math.floor(cols / 90));
+    for (let k = 0; k < sweep; k++) {
+      const c = clearFront + k;
+      if (c >= cols) continue;
+      for (let r = 0; r < rows; r++) occ[idx(c, r)] = 0;
+    }
+    clearFront += sweep;
+    if (clearFront >= cols) { clearing = false; occupiedCount = 0; }
+  }
+
+  // render sand grid -> small canvas -> scaled onto main
+  const d = sandImg.data;
+  for (let i = 0, p = 0; i < occ.length; i++, p += 4) {
+    if (occ[i]) {
+      const l = shadeArr[i];
+      // simple HSL(hue,60%,l%) -> approximate RGB for warm amber
+      const light = l / 100;
+      d[p] = Math.min(255, 40 + light * 300);
+      d[p + 1] = Math.min(255, 20 + light * 220);
+      d[p + 2] = Math.min(255, 5 + light * 90);
+      d[p + 3] = 255;
+    } else {
+      d[p] = 0; d[p + 1] = 0; d[p + 2] = 0; d[p + 3] = 0;
+    }
+  }
+  sctx.putImageData(sandImg, 0, 0);
+
+  mctx.fillStyle = 'hsl(38, 26%, 6%)';
+  mctx.fillRect(0, 0, W, H);
+  mctx.drawImage(sandCanvas, 0, 0, cols, rows, 0, 0, W, H);
+
+  // active (falling) grains drawn crisp on top
+  mctx.fillStyle = 'hsla(38, 70%, 82%, 0.9)';
+  for (const g of active) {
+    if (g.row < 0) continue;
+    mctx.fillRect(g.col * CELL, g.row * CELL, CELL, CELL);
+  }
+
+  requestAnimationFrame(tick);
+}
+tick();
+</script>
+</body>
+</html>
